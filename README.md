@@ -180,6 +180,164 @@ Iowa-specific compatibility routes:
 - `GET /api/iowa/cameras/{camera_id}/snapshot`
 - `GET /api/iowa/cameras/{camera_id}/info`
 
+## Interview Prep Guide (Backend + YOLO)
+
+If you need to prepare deeply for technical interviews around this project, focus on the following in this order.
+
+### 1) Backend system architecture (must know end-to-end)
+
+- FastAPI app boot flow in `backend/app/main.py`:
+  - verify DB connection (`verify_connection`)
+  - ensure DB indexes (`ensure_performance_indexes`)
+  - create runtime dirs (`evidence`, `uploads`, `data`)
+  - load model once (`AccidentDetector.load()`)
+  - wire detector into processor/routes/monitor service
+  - preload Caltrans + Iowa camera metadata
+  - restore active monitor sessions from DB
+- Route boundaries in `backend/app/routes/*`:
+  - auth, detection, incidents/events/tickets, stats, settings, alerts, cameras
+- Service boundaries in `backend/app/services/*`:
+  - camera ingest/caching/proxy
+  - monitor loop orchestration
+  - event/ticket creation
+  - notification dispatch
+
+### 2) Core request/data flow you should be able to explain
+
+#### Manual upload flow (`/api/detect/video`, `/api/detect/image`, `/api/detect/images`)
+
+1. Validate extension/type
+2. Save upload (video path) or decode image
+3. Read runtime settings (threshold/toggles)
+4. Run inference via `VideoProcessor`
+5. Deduplicate near-duplicate accidents
+6. Persist Event rows, create Ticket rows for accidents
+7. Store evidence locally first
+8. Async backfill evidence to Supabase Storage
+9. Dispatch notifications (Twilio/Email/Webhook/Telegram pathways)
+
+#### Live monitoring flow (camera monitor routes)
+
+1. Start monitor thread per camera (snapshot or HLS stream mode)
+2. Poll based on camera update frequency (or stream interval)
+3. Skip unchanged snapshots via HEAD/content change checks
+4. Run detection on new frame
+5. Create events/tickets + update monitor status metrics
+6. Persist active monitor state for restart recovery
+
+### 3) Data/model layer (know entity relationships)
+
+From `backend/app/models.py` and related services:
+
+- `Event` = detection occurrence (type/confidence/severity/source/evidence/bbox metadata)
+- `Ticket` = workflow object created from accident events
+- `ActiveMonitor` = persisted monitor state (camera_id, stream mode, pause state)
+- Status lifecycle and operational behavior:
+  - incidents/tickets progress through operational states (issued/pending/resolved style workflow)
+  - monitor state survives restarts through `active_monitors` table restoration
+
+### 4) Config and environment controls (high interview value)
+
+From `backend/app/config.py`:
+
+- inference controls:
+  - `MODEL_PATH`, `MODEL_URL`
+  - `CONFIDENCE_THRESHOLD_MANUAL`, `CONFIDENCE_THRESHOLD_CCTV`
+  - `DETECT_ACCIDENTS`
+- storage/runtime:
+  - `EVIDENCE_DIR`, `UPLOADS_DIR`, `DATA_DIR`
+- platform dependencies:
+  - `DATABASE_URL`, Supabase keys
+- notification controls:
+  - Twilio + Telegram credentials and cooldown
+- camera caching:
+  - `CAMERA_LIST_CACHE_TTL_HOURS`
+
+### 5) YOLO/ONNX pipeline details (you must be precise)
+
+From `backend/app/detection/detector.py` and `processor.py`:
+
+- runtime:
+  - ONNX Runtime on CPU (`CPUExecutionProvider`)
+  - model auto-downloads if missing
+- preprocessing:
+  - force RGB
+  - resize to `640x640`
+  - normalize to `[0,1]`
+  - `HWC -> CHW`, add batch dim (`NCHW`)
+- output parsing:
+  - supports both common output shapes:
+    - `[x, y, w, h, conf, class_id]`
+    - `[x, y, w, h, class_scores...]`
+  - handles transposed outputs (`(6, N)` vs `(N, 6+)`)
+  - keeps only class `0` (accident) above threshold
+  - rescales boxes back to original image dimensions
+  - clamps boxes to image bounds
+- post-inference semantics:
+  - severity mapping by confidence:
+    - high >= 0.85
+    - medium >= 0.70
+    - low < 0.70
+  - per-image/per-frame dedup keeps highest-confidence accident
+  - video dedup suppresses near-frame duplicates
+- evidence generation:
+  - annotate bbox + confidence onto frames
+  - save JPEG evidence locally first for low-latency responses
+
+### 6) Concurrency, reliability, and performance topics to prepare
+
+- Why CPU inference + single model load in lifespan
+- `asyncio.to_thread` use to avoid blocking event loop for heavy processing
+- thread-based monitor design (one thread per active camera)
+- lock usage for shared state (`_progress`, monitor maps)
+- cache strategy:
+  - in-memory camera cache + on-disk CSV cache
+- resilience strategy:
+  - local evidence write before remote storage backfill
+  - graceful handling of notification/storage failures
+  - monitor restore on restart
+- stream capture reliability:
+  - persistent ffmpeg process + restart/backoff behavior
+
+### 7) Security and production-readiness questions to expect
+
+- auth model:
+  - bearer token checks through `get_current_admin`
+  - protected API routes vs public health check
+- input validation:
+  - strict extension allowlists for uploads
+- operational safety:
+  - idempotent monitor persistence methods
+  - DB transaction handling (`commit`/`rollback`)
+- likely improvements you can discuss:
+  - background job queue for long-running processing
+  - stronger rate limits and request size limits
+  - model versioning/rollbacks
+  - observability (structured logs, tracing, metrics dashboards)
+
+### 8) Backend files to master before interview
+
+- `backend/app/main.py`
+- `backend/app/config.py`
+- `backend/app/detection/detector.py`
+- `backend/app/detection/processor.py`
+- `backend/app/routes/detection.py`
+- `backend/app/services/monitor_service.py`
+- `backend/app/services/camera_service.py`
+- `backend/app/services/event_service.py`
+- `backend/app/services/ticket_service.py`
+- `backend/app/models.py`, `backend/app/schemas.py`, `backend/app/database.py`
+
+### 9) Interview drill checklist (practice verbally)
+
+- Explain one complete request path from upload -> detection -> event -> ticket -> notification.
+- Explain difference between manual upload and live monitoring pipelines.
+- Explain why dedup exists at multiple layers and how windows are chosen.
+- Explain how evidence storage is made robust against transient cloud failures.
+- Explain YOLO preprocessing and output decoding math step-by-step.
+- Explain failure handling (bad file, model missing, DB failure, notification failure, stream failure).
+- Explain scaling options (horizontal API scale, async workers, batching, GPU/accelerator inference).
+
 ## Testing
 
 Backend tests:
